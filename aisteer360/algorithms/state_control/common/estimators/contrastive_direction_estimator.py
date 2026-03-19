@@ -2,6 +2,7 @@
 import logging
 from typing import Sequence
 
+import numpy as np
 import torch
 from sklearn.decomposition import PCA
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
@@ -241,7 +242,7 @@ class ContrastiveDirectionEstimator(BaseEstimator[SteeringVector]):
             Hn = _pool_over_spans(hs_neg[layer_id], spans_neg)  # [N, H]
 
             # compute pairwise differences
-            diffs = (Hp - Hn).numpy()  # [N, H]
+            diffs = (Hp - Hn).float().numpy()  # [N, H]
 
             if spec.method == "pca_pairwise":
                 # fit PCA to get principal direction
@@ -249,11 +250,19 @@ class ContrastiveDirectionEstimator(BaseEstimator[SteeringVector]):
                 pca.fit(diffs)
                 direction = pca.components_[0]  # shape [H]
                 variance = float(pca.explained_variance_ratio_[0])
+            elif spec.method == "mean_diff":
+                # CAA-style mean difference direction
+                direction = diffs.mean(axis=0)
+                norm = np.linalg.norm(direction)
+                if norm > 0:
+                    direction = direction / norm
+                variance = None
             else:
                 raise ValueError(f"Unknown method: {spec.method}")
 
             directions[layer_id] = torch.tensor(direction, dtype=torch.float32).unsqueeze(0)  # [1, H]
-            explained_variances[layer_id] = variance
+            if variance is not None:
+                explained_variances[layer_id] = variance
 
         logger.debug("Finished fitting contrastive directions")
         return SteeringVector(

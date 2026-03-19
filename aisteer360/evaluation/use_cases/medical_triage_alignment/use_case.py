@@ -186,7 +186,7 @@ class MedicalTriageAlignment(UseCase):
         batch_size: int = int(kwargs.get("batch_size", 1))
 
         # Form prompt data
-        prompt_data: list[dict[str, str]] = []
+        prompt_data: list[dict[str, Any]] = []
         for instance in self.evaluation_data:
             data_id = instance['id']
             scenario = instance['scenario']

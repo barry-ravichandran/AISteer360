@@ -57,7 +57,7 @@ class MedicalTriageAlignment(UseCase):
             prompt_type: Type of prompt to use ('baseline' or 'attribute'). Default is 'baseline'.
             attribute_system_prompt: Attribute-specific system prompt from align-system. When
                 provided, prompt_type is automatically set to 'attribute'. The system prompt
-                provides the ethical framing; the scenario already contains the question.
+                provides the attribute framing; the scenario already contains the question.
             **kwargs: Additional arguments passed to parent class.
         """
         # Load raw MTA data if path provided
@@ -264,7 +264,7 @@ class MedicalTriageAlignment(UseCase):
         """Build a triage prompt as chat messages with system and user roles.
 
         The scenario text already contains the question (e.g. "What do you do?"),
-        so no additional question phrasing is added. The ethical framing comes
+        so no additional question phrasing is added. The attribute framing comes
         entirely from the system prompt.
 
         Args:
@@ -299,7 +299,7 @@ class MedicalTriageAlignment(UseCase):
 
         Uses the exact ``baseline_system_prompt`` from ITM-Kitware/align-system
         (https://github.com/ITM-Kitware/align-system) — a generic medical-triage
-        assistant with no ethical-dimension bias.
+        assistant with no attribute-specific bias.
 
         Args:
             scenario: Full scenario description.
@@ -328,8 +328,8 @@ class MedicalTriageAlignment(UseCase):
     ) -> list[dict[str, str]]:
         """Format triage scenario with the attribute-specific system prompt.
 
-        The system prompt describes the ethical dimension (e.g. moral desert,
-        fairness) so the model's reasoning is framed accordingly.
+        The system prompt describes the decision-making attribute (e.g. moral
+        desert, fairness) so the model's reasoning is framed accordingly.
 
         Args:
             scenario: Full scenario description.

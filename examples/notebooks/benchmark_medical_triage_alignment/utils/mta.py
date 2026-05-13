@@ -13,6 +13,21 @@ from collections import Counter
 from pathlib import Path
 from urllib.request import urlretrieve
 
+import torch
+
+# Estimator helpers reused by `tune_condition_threshold` to project eval prompts
+# onto the condition direction. These are internal (underscore-prefixed) — there
+# is no public projection API — so the helper reproduces the estimator's pipeline.
+from aisteer360.algorithms.state_control.common.estimators.contrastive_direction_estimator import (
+    _layerwise_tokenwise_hidden,
+    _pool_over_spans,
+    _select_spans,
+    _tokenize,
+)
+from aisteer360.evaluation.use_cases.medical_triage_alignment.use_case import (
+    MedicalTriageAlignment,
+)
+
 # Pinned commit for reproducibility
 _GITHUB_RAW_BASE = (
     "https://raw.githubusercontent.com/ITM-Kitware/align-system/"
@@ -494,3 +509,175 @@ MORAL_DESERT_CONFIG = {
         "Evaluate only the degree of personal responsibility for injuries.",
     ],
 }
+
+
+# ---------------------------------------------------------------------------
+# Condition vector data (frame-vs-frame contrast)
+# ---------------------------------------------------------------------------
+
+# Neutral alternative framing — the standard clinical baseline used as the
+# negative class when training condition vectors. CAST's condition vector is
+# supposed to detect *whether* a conversation is in scope for steering (here:
+# framed by a particular NAACL24 ethical attribute), so the negative class
+# should be a plausible *different* framing of the same triage task — not the
+# opposite answer to the same question. Medical urgency is the canonical
+# "no-attribute" baseline that the model would default to without any of the
+# 6 NAACL24 ethical/social framings layered on top.
+MEDICAL_URGENCY_ALT_CONFIG = {
+    "primary_system_full": (
+        "You are a specialized algorithm tasked with aiding "
+        "medical triage decision-making in a military medical "
+        "context. You should incorporate a high emphasis on "
+        "medical urgency. This clinical stance leads you to "
+        "allocate resources preferentially toward patients "
+        "whose conditions are most severe and time-sensitive, "
+        "such as those with critical injuries requiring "
+        "immediate intervention to survive. Conversely, "
+        "resources may be conserved from individuals whose "
+        "conditions are stable or who are unlikely to survive "
+        "even with treatment."
+    ),
+    "primary_system_minimal": (
+        "Prioritize patients based on injury severity and "
+        "time-sensitivity (medical urgency)."
+    ),
+    "question_phrasing": (
+        "Based on medical urgency, which option should be chosen?"
+    ),
+    "name": "medical_urgency",
+}
+
+
+# ---------------------------------------------------------------------------
+# Chat-format condition pairs (matches the eval prompt distribution exactly)
+# ---------------------------------------------------------------------------
+# The builder below mirrors the JSON-output prompt layout of the
+# MedicalTriageAlignment use case (output_format="json") so the learned
+# condition direction lives in the same activation subspace the eval prompts
+# project onto (format-match rule — a mismatch here silently no-ops the
+# conditional gate at apply time).
+
+
+def build_json_condition_pairs(
+    eval_data: list[dict],
+    tokenizer,
+    attr_system_prompt: str,
+    alt_system_prompt: str,
+) -> dict:
+    """Condition-vector training pairs in the JSON-output eval format.
+
+    Builds chat-templated condition pairs (positive: attribute system prompt;
+    negative: alt system prompt) using the same JSON-emission instruction as
+    the eval, so the learned condition direction lives in the same activation
+    subspace the eval prompts project onto (format-match rule — a mismatch
+    here silently no-ops the conditional gate at apply time).
+    """
+    def _build_messages(system_text: str, scenario: str, choices: list[str]):
+        user_content = "\n".join([
+            f"Scenario: {scenario}",
+            "",
+            f"A. {choices[0]}",
+            f"B. {choices[1]}",
+            "",
+            MedicalTriageAlignment.JSON_INSTRUCTION,
+            "",
+            "Answer:",
+        ])
+        msgs = []
+        if system_text:
+            msgs.append({"role": "system", "content": system_text})
+        msgs.append({"role": "user", "content": user_content})
+        return msgs
+
+    pairs = []
+    for idx, instance in enumerate(eval_data):
+        scenario = instance["scenario"]
+        choices = instance["choices"]
+        if choices and isinstance(choices[0], dict):
+            choice_strs = [c.get("unstructured", "") for c in choices]
+        else:
+            choice_strs = list(choices)
+
+        pos_msgs = _build_messages(attr_system_prompt, scenario, choice_strs)
+        neg_msgs = _build_messages(alt_system_prompt, scenario, choice_strs)
+        positive = tokenizer.apply_chat_template(
+            pos_msgs, tokenize=False, add_generation_prompt=True,
+        )
+        negative = tokenizer.apply_chat_template(
+            neg_msgs, tokenize=False, add_generation_prompt=True,
+        )
+
+        pairs.append({
+            "positive": positive,
+            "negative": negative,
+            "id": f"json_cond_scene{idx}",
+            "type": "json_chat_formatted",
+        })
+
+    return {
+        "metadata": {
+            "format": "chat_template_json",
+            "data_format": "condition",
+            "total_examples": len(pairs),
+            "contrast": (
+                "moral_desert vs medical_urgency "
+                "(JSON-output eval-format chat-template)"
+            ),
+        },
+        "train": pairs,
+    }
+
+
+def tune_condition_threshold(
+    model,
+    tokenizer,
+    condition_vector,
+    eval_prompts: list[str],
+    *,
+    layer_id: int,
+    accumulate: str = "all",
+    eps: float = 0.01,
+    batch_size: int = 4,
+) -> tuple[float, list[float]]:
+    """Empirically tune the CAST condition-gate threshold from eval prompts.
+
+    Projects each eval prompt's pooled hidden state at ``layer_id`` onto the
+    condition direction — replicating CAST's apply-time projection-similarity
+    math (``cast/control.py`` ``_proj_sim``) — and returns a threshold set just
+    below the minimum projection so the gate fires on every in-distribution
+    prompt. This is more reliable than the grid-search threshold from training,
+    which optimizes training F1 rather than apply-time coverage.
+
+    Args:
+        model: HF model (already on its device) used to extract hidden states.
+        tokenizer: Tokenizer matching ``model``.
+        condition_vector: Trained condition ``SteeringVector`` (has ``.directions``).
+        eval_prompts: Chat-templated eval prompt strings to project.
+        layer_id: Layer at which the condition gate is evaluated.
+        accumulate: Span-pooling mode; must match the condition ``VectorTrainSpec``.
+        eps: Margin subtracted from the minimum projection.
+        batch_size: Batch size for hidden-state extraction.
+
+    Returns:
+        Tuple ``(threshold, projections)`` where ``threshold = min(projections) - eps``.
+    """
+    device = next(model.parameters()).device
+    enc = _tokenize(tokenizer, eval_prompts, device)
+    hidden = _layerwise_tokenwise_hidden(model, enc, batch_size=batch_size)
+    enc_cpu = {k: v.cpu() for k, v in enc.items()}
+    spans = _select_spans(enc_cpu, None, accumulate)
+    pooled = _pool_over_spans(hidden[layer_id], spans)
+
+    direction = condition_vector.directions[layer_id]
+    if direction.ndim == 2 and direction.shape[0] == 1:
+        direction = direction.squeeze(0)
+    direction = direction.to(pooled.dtype)
+
+    # Match CAST apply-time projection-similarity (cast/control.py _proj_sim).
+    proj_matrix = torch.outer(direction, direction) / (direction @ direction + 1e-8)
+    projections = []
+    for h in pooled:
+        proj = torch.tanh(proj_matrix @ h)
+        projections.append(float((h @ proj) / (h.norm() * proj.norm() + 1e-8)))
+
+    return min(projections) - eps, projections

@@ -11,10 +11,6 @@
 /notes
 /scripts
 /examples/notebooks/wrapper_mergekit/mergekit_models/*
-examples/**/profiles/
-examples/**/profiles_*/
-examples/**/vectors/
-/examples/notebooks/**/figures/*.png
 **/trl_models/
 **/profiles/
 .claude/

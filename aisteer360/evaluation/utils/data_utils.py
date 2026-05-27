@@ -6,6 +6,32 @@ import numpy as np
 import pandas as pd
 
 
+def _steering_vector_fingerprint(obj: Any) -> str | None:
+    """Return a stable content hash for a SteeringVector-like object, else None.
+
+    Hashes ``model_type`` plus each layer's direction-tensor bytes, so the id is
+    reproducible across processes and torch versions. ``repr()`` is not usable as
+    a config key because its tensor formatting is truncated and version-dependent.
+    """
+    directions = getattr(obj, "directions", None)
+    model_type = getattr(obj, "model_type", None)
+    if model_type is None or not isinstance(directions, Mapping):
+        return None
+    import hashlib
+
+    h = hashlib.md5()
+    h.update(str(model_type).encode())
+    for layer_id in sorted(directions, key=lambda k: int(k)):
+        tensor = directions[layer_id]
+        try:
+            arr = np.ascontiguousarray(tensor.detach().cpu().numpy().astype(np.float32))
+        except AttributeError:
+            return None
+        h.update(f"|{int(layer_id)}:".encode())
+        h.update(arr.tobytes())
+    return f"SteeringVector:{h.hexdigest()[:16]}"
+
+
 def to_jsonable(obj: Any) -> Any:
     """Conversion to json-safe format.
 
@@ -14,6 +40,7 @@ def to_jsonable(obj: Any) -> Any:
     - mappings: recurse, stringify keys
     - sequences: recurse on elements
     - numpy scalars/arrays: convert to Python / list
+    - SteeringVector-like objects: a stable content fingerprint
     - everything else: repr(obj)
     """
     from pathlib import Path as _Path
@@ -36,9 +63,13 @@ def to_jsonable(obj: Any) -> Any:
     if isinstance(obj, (list, tuple, set)):
         return [to_jsonable(v) for v in obj]
 
+    fingerprint = _steering_vector_fingerprint(obj)
+    if fingerprint is not None:
+        return fingerprint
+
     if callable(obj):
         return f"callable:{getattr(obj, '__qualname__', type(obj).__name__)}"
-    
+
     return repr(obj)
 
 
@@ -112,6 +143,9 @@ def _hash_params(params: dict[str, Any]) -> str:
     import json
 
     def _default(obj: Any) -> str:
+        fingerprint = _steering_vector_fingerprint(obj)
+        if fingerprint is not None:
+            return fingerprint
         if callable(obj):
             return f"callable:{getattr(obj, '__qualname__', type(obj).__name__)}"
         return str(obj)
